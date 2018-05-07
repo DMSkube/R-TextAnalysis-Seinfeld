@@ -1,0 +1,623 @@
+---
+title: "Seinfeld-analysis"
+author: "Kai Middlebrook & Daniel Skube"
+date: "05/03/2018"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data Preparation 
+
+#### Load all necessary libraries
+```{r warning=FALSE, message=FALSE}
+library(tidyverse)
+library(lubridate) # date manipulation
+library(tidytext) # text manipulation
+library(wordcloud) # word cloud
+library(stringr) # string manipulation
+library(ngram) # string manipulation 
+library(topicmodels) # topic modeling 
+library(tm) # for converting dfs into Document-Term Matrices
+library(igraph)
+library(ggraph)
+library(knitr) # tables in RMarkdown
+library(scales)
+library(widyr)
+library(reshape2) # turn data into a matrix 
+```
+
+#### Read in data 
+```{r message=FALSE, warning=FALSE}
+setwd("/Users/kaimiddlebrook/Documents/s2-courses-2017-18/data-science-with-r/case-study")
+scripts <- read_csv("scripts.csv")
+episode_info <- read_csv("episode_info.csv")
+
+# fix episode_info column types
+episode_info$AirDate <- mdy(episode_info$AirDate)
+episode_info$Season <- as.factor(episode_info$Season)
+episode_info$EpisodeNo <- as.factor(episode_info$EpisodeNo)
+
+scripts$EpisodeNo <- as.factor(scripts$EpisodeNo)
+scripts$Season <- as.factor(scripts$Season)
+scripts$Character <- as.factor(scripts$Character)
+
+```
+
+#### Tokenization: Seperating lines of dialog into rows by each word in the dialog
+```{r message=FALSE}
+# one-token-per-row format --> each row represents a word in the dialogue
+tidy_scripts <- scripts %>% 
+  unnest_tokens(word, Dialogue)
+
+# remove stop words from our data
+data("stop_words")
+tidy_scripts <- tidy_scripts %>% 
+  anti_join(stop_words) %>% 
+  select(-X1)
+
+kable(head(tidy_scripts), format = "html",
+      caption = "Tokenization of each word in the scripts data frame")
+
+tidy_season_script <- function(season_num) {
+  myDF <-  tidy_scripts %>% 
+    group_by(Season) %>% 
+    filter(Season == season_num)
+  return(myDF)
+}
+```
+
+## How often did each character speak?
+
+```{r}
+top9_mainCharacters <-  scripts %>% 
+  group_by(Character) %>% 
+  summarise(Count = n()) %>% 
+  arrange(desc(Count)) %>% 
+  ungroup() %>% 
+  mutate(Character = reorder(Character, Count)) %>% 
+  head(9) 
+
+top9_mainCharacters %>% 
+  ggplot() +
+  geom_bar(aes(x = Character, y = Count), stat = "identity", fill = "yellow") +
+  geom_text(aes(x = Character, y = 1, label = paste0("(", Count, ")")), hjust = 0, vjust = .5, 
+            size = 4, fontface = 'bold') +
+  scale_y_continuous(labels = comma) +
+  labs(x = "Character", y = "Total Lines Spoken", 
+       title = "Number of lines spoken by top characters") +
+  coord_flip() + theme_bw()
+```
+
+## Which character spoke long sentences?
+```{r}
+scripts <- scripts %>% 
+  mutate(len = str_count(Dialogue, "\\S+"))
+
+longWindedCharacters <- scripts %>% 
+  filter(Character %in% top9_mainCharacters$Character)
+
+summary(longWindedCharacters)
+
+ # use median rather than mean because the len is skewed 
+longWindedCharacters %>% 
+  group_by(Character) %>% 
+  summarise(Median = median(len, na.rm = T)) %>% 
+  mutate(Character = reorder(Character, Median)) %>% 
+  ggplot() +
+  geom_bar(aes(x = Character, y = Median), stat = "identity", fill = "red") +
+  geom_text(aes(x = Character, y = Median, label = paste0("(", Median, ")")), vjust = .5, hjust = 1.5,
+            fontface = "bold") +
+  ggtitle("Median number of words spoken by character") +
+  coord_flip()
+```
+
+## What were the most frequently used words in Seinfeld?
+```{r}
+tidy_scripts %>% 
+  count(word, sort = TRUE) %>% 
+  slice(1:10) %>% 
+  mutate(word = reorder(word, n)) %>% 
+  ggplot(aes(x = word, y = n)) +
+  geom_bar(stat = "identity", fill = "purple") +
+  geom_text(aes(x = word, y = n, label = paste0("(", n, ")", sep = ""),
+                vjust = 0.4, hjust = 1.2, fontface = "bold")) +
+  scale_y_continuous(name = "Frequency", labels = comma) +
+  xlab("Word") +
+  ggtitle("Top 10 most frequently used words and their frequencies") +
+  coord_flip()
+```
+
+## Which season's script had the most words?
+```{r}
+tidy_scripts %>% 
+  group_by(Season) %>% 
+  summarise(numWords = n() / 1000) %>% 
+  mutate(Season = reorder(Season, numWords)) %>% 
+  ggplot() +
+  geom_col(aes(x = Season, y = numWords, fill = Season)) +
+  geom_text(aes(x = Season, y = numWords, 
+                label = paste("(", round(numWords, digits = 2), ")", sep = "")),
+            fontface = "bold", vjust = 1.4) +
+  labs(x = "Season", y = "Total Word Count (in thousands)",
+       title = "Total Word Count of Each Season (in thousands)")
+  
+```
+
+
+## What are the most frequently used words in each season?
+```{r}
+tidy_season_1 <- tidy_season_script(1)
+tidy_season_2 <- tidy_season_script(2)
+tidy_season_3 <- tidy_season_script(3) 
+tidy_season_4 <- tidy_season_script(4)
+tidy_season_5 <- tidy_season_script(5)
+tidy_season_6 <- tidy_season_script(6)
+tidy_season_7 <- tidy_season_script(7)
+tidy_season_8 <- tidy_season_script(8)
+tidy_season_9 <- tidy_season_script(9)
+
+graph_word_total_by_season <- function(tidy_DF, season_num) {
+  tidy_DF %>% 
+    count(word) %>%
+    mutate(word = reorder(word, n)) %>%  
+    top_n(10, n) %>% 
+    ggplot() + 
+    geom_col(aes(x = word, y = n)) +
+    geom_text(aes(x = word, y = n, label = paste0("(", n, ")", sep = "")), fontface = "bold") +
+    labs(x = "Words", y = "Frequency",
+         title = paste0("Season ", season_num, "'s Top 10 Words By Frequency", sep = ""))
+}
+
+graph_word_total_by_season(tidy_season_1, 1)
+# tidy_scripts %>% 
+#   group_by(Season) %>% 
+#   count(word) %>% 
+#   top_n(5) %>% 
+#   
+#   ggplot() +
+#   geom_col(aes(x = word, y = n)) +
+#   facet_wrap( ~ Season)
+
+```
+
+
+## Which words does Jerry use most often?
+```{r}
+create_wordcloud_byCharacter <- function(data, myCharacter) {
+  data %>% 
+    filter(Character == myCharacter) %>% 
+    count(word) %>% 
+    arrange(desc(n)) %>% 
+    with(wordcloud(word, n, max.words = 50, rot.per = 0, random.order = FALSE,
+                   colors = brewer.pal(8, "Dark2")))
+}
+
+create_wordcloud_byCharacter(tidy_scripts, "JERRY")
+```
+
+## Does Seinfeld have a positive or negative sentiment? 
+```{r}
+kable(tidy_scripts %>% 
+  inner_join(get_sentiments("bing")) %>% 
+  count(sentiment))
+```
+
+## Does sentiment shift by season? 
+
+It looks like the ealiest seasons had a negative overall sentiment, but where less negative overall than later seasons.
+
+```{r}
+tidy_scripts %>% 
+  inner_join(get_sentiments("bing")) %>% 
+  group_by(Season) %>%
+  count(sentiment) %>% 
+  spread(sentiment, n, fill = 0) %>% 
+  mutate(overall_sentiment = positive - negative) %>% 
+  
+  ggplot() +
+  geom_col(aes(x = Season, overall_sentiment, fill = Season), show.legend = F) +
+  geom_text(aes(x = Season, y = overall_sentiment, label = overall_sentiment), 
+            vjust = -1, fontface = "bold") +
+  labs(x = "Season", y = "Overall Sentiment Score", title = "Overal Sentiment Score By Season")
+```
+
+## What were the most common postive and negative words in Seinfeld?
+
+```{r}
+scoring_sentiment <- "bing"
+tidy_scripts %>% 
+  inner_join(get_sentiments(scoring_sentiment)) %>% 
+  count(word, sentiment, sort = T) %>% 
+  ungroup() %>% 
+  group_by(sentiment) %>% 
+  filter(word != "funny") %>% 
+  top_n(10) %>% 
+  ungroup() %>% 
+  mutate(word = reorder(word, n)) %>% 
+  
+  ggplot() +
+  geom_col(aes(x = word, y = n, fill = sentiment), show.legend = F) +
+  facet_wrap(~sentiment, scales = "free_y") +
+  labs(x = "Word", y = "Contribution to sentiment") +
+  coord_flip() +
+  theme_light()
+```
+
+## Let's take a look at positive versus negative words using a wordcloud.
+
+Interestingly enough, while Seinfeld has a negative overall sentiment score, the positive words like `nice`, `love`, and `pretty` where used more often than negative words. 
+
+```{r}
+tidy_scripts %>% 
+  inner_join(get_sentiments(scoring_sentiment)) %>% 
+  count(word, sentiment, sort = T) %>% 
+  acast(word ~ sentiment, value.var = "n", fill = 0) %>% 
+  comparison.cloud(colors = c("red", "blue"), max.words = 100, rot.per = 0)
+```
+
+## Let's consider sentiment beyond words and look at sentiment by season and episode number.
+
+```{r}
+tidy_scripts %>% 
+  group_by(EpisodeNo, Season) %>%
+  mutate(total_words = n()) %>% 
+  inner_join(get_sentiments(scoring_sentiment)) %>% 
+  count(word, sentiment, sort = T) %>% 
+  spread(sentiment, n, fill = 0) %>% 
+  mutate(sentiment = positive - negative) %>% 
+  summarise(overall_sentiment = sum(sentiment)) %>% 
+  
+  ggplot() +
+  geom_col(aes(x = EpisodeNo, y = overall_sentiment, fill = Season), show.legend = F) +
+  facet_wrap(~Season, ncol = 3, scales = "free_x")
+  
+```
+
+
+## Term Frequency 
+
+```{r}
+seinfeld_words <- scripts %>%
+  unnest_tokens(word, Dialogue) %>%
+  group_by(Season) %>%
+  count(word, SEID, EpisodeNo, Season, sort = T) %>% 
+  ungroup()
+
+seinfeld_words
+
+
+totalWords_by_season <-  seinfeld_words %>% 
+   group_by(Season) %>% 
+   summarise(total_words = sum(n))
+
+seinfeld_words <- left_join(seinfeld_words, totalWords_by_season)
+
+```
+
+
+## Zipf's law
+#### Zipf’s law states that the frequency that a word appears is inversely proportional to its rank.
+
+```{r}
+freq_by_rank <- seinfeld_words %>% 
+  group_by(Season) %>% 
+  mutate(rank = row_number(),
+         term_frequency = (n / total_words)) 
+
+kable(head(freq_by_rank))
+
+```
+
+To visualize Zipf's law we can plot `rank` on the x-axis and `term_frequency` on the y-axis, on logarithmic scales. This should yield an inversely proportional relationship with a constant, negative slope. 
+
+```{r}
+freq_by_rank %>% 
+  ggplot() +
+  geom_line(aes(x = rank, y = term_frequency, color = Season),
+            show.legend = F, size = 1, alpha = .8) +
+  scale_x_log10() +
+  scale_y_log10()
+```
+
+## Using tf-idf to find words that are important (i.e. common) in Seinfeld, but not to common.
+
+```{r}
+seinfeld_words <- seinfeld_words %>% 
+  bind_tf_idf(word, Season, n)
+
+kable(head(seinfeld_words))
+```
+
+Let's look at words with high tf-idf in Seinfeld.
+
+```{r}
+plot_seinfeld <-  seinfeld_words %>%
+  arrange(desc(tf_idf)) %>% 
+  mutate(word = factor(word, levels = rev(unique(word)))) %>% 
+  group_by(Season) %>% 
+  top_n(10, tf_idf) 
+  
+
+plot_seinfeld %>% 
+  ungroup() %>% 
+  mutate(word = reorder(word, tf_idf)) %>% 
+  ggplot(aes(x = word, y = tf_idf, fill = Season)) +
+  geom_col(show.legend = F) +
+  facet_wrap(~Season, ncol = 4, scales = "free") +
+  labs(x = NULL, y = "tf-idf") +
+  coord_flip() +
+  theme_light()
+```
+
+# Analyzing bigrams to find words preceeded by not
+
+```{r}
+bigrams_separated <- scripts %>% 
+  unnest_tokens(bigram, Dialogue, token = "ngrams", n = 2) %>% 
+  separate(bigram, c("word1", "word2"), sep = " ")
+
+bigrams_filtered <- bigrams_separated %>% 
+  filter(!word1 %in% stop_words$word) %>% 
+  filter(!word2 %in% stop_words$word)
+
+# bing <- get_sentiments("bing")
+
+not_words <- bigrams_separated %>% 
+  filter(word1 == "not") %>% 
+  inner_join(get_sentiments("afinn"), by = c(word2 = "word")) %>% 
+  count(word2, score, sort = T) %>% 
+  ungroup()
+
+not_words %>% 
+  mutate(contribution = n * score) %>% 
+  arrange(desc(abs(contribution))) %>% 
+  head(20) %>% 
+  mutate(word2 = reorder(word2, contribution)) %>% 
+  
+  ggplot() +
+  geom_col(aes(x = word2, y = contribution, fill = (n * score > 0)), show.legend = F) + 
+  labs(x = "Words preceeded by \"not\"", y = "Sentiment score * number of occurences") +
+  coord_flip()
+
+
+  
+```
+
+We can see that our sentiment score may be misleading. The bigrams "not like", "not good", and "not bad" were overwhelmingly the largest cause of misidentification. The bigrams "not like" and "not good" made the text seem more positive than it is, while the phrase "not bad" made the text appear more negative than it is. 
+
+### Let's look at tf-idf of bigrams to see the most important phrases in Seinfeld by season
+```{r}
+bigrams_united <- bigrams_separated %>% 
+  unite(bigram, word1, word2, sep = " ") 
+
+bigrams_tf_idf <- bigrams_united %>% 
+  count(Season, bigram) %>% 
+  bind_tf_idf(bigram, Season, n) %>% 
+  arrange(desc(tf_idf)) %>% 
+  mutate(bigram = factor(bigram, rev(unique(bigram)))) %>% 
+  group_by(Season) %>% 
+  top_n(10, tf_idf)
+
+bigrams_tf_idf %>% 
+  ungroup() %>% 
+  mutate(bigram = reorder(bigram, tf_idf)) %>% 
+  ggplot() +
+  geom_col(aes(x = bigram, y = tf_idf, fill = Season), show.legend = F) +
+  facet_wrap(~Season, ncol = 4, scales = "free") +
+  labs(x = NULL, y = "tf-idf") +
+  coord_flip() +
+  theme_light()
+```
+
+
+
+# Topic Modeling: Is Seinfeld really a show about nothing?
+
+```{r}
+season_word_counts <- tidy_scripts %>%
+  anti_join(stop_words) %>% 
+  filter(word != c("yeah", "hey")) %>% 
+  count(Season, word, sort = T) %>% 
+  ungroup()
+
+seasons_dtm <- season_word_counts %>% 
+  cast_dtm(Season, word, n)
+# seasons_dtm
+
+seasons_lda <- LDA(seasons_dtm, k = 9, control = list(seed = 1234))
+seasons_lda  
+
+
+# per-topic-per-word probabilities  
+seasons_topics <- tidy(seasons_lda, matrix = "beta")
+seasons_topics
+
+
+# find the top 8 terms within each topic 
+season_top_terms <- seasons_topics %>% 
+  group_by(topic) %>% 
+  top_n(8, beta) %>% 
+  ungroup() %>% 
+  arrange(topic, -beta)
+
+season_top_terms %>% 
+  mutate(term = reorder(term, beta)) %>% 
+  ggplot() +
+  geom_col(aes(x = term, y = beta, fill = factor(topic)), show.legend = F) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  theme_light()
+
+```
+
+## Per-document-per-topic probabilities 
+
+```{r}
+seasons_doc_topic_probabilities <- tidy(seasons_lda, matrix = "gamma")
+seasons_doc_topic_probabilities
+
+seasons_doc_topic_probabilities %>% 
+  mutate(document = reorder(document, topic * gamma)) %>% 
+  ggplot() +
+  geom_boxplot(aes(factor(topic), gamma)) +
+  labs(x = "Season", y = "Gamma", title = "Probability Of A Season Belonging To A Topic") 
+
+
+
+```
+
+## Which words were assigned in each season were assigned to which topic?
+
+```{r}
+word_topic_assignments <- augment(seasons_lda, data = seasons_dtm)
+
+season_classification <-  seasons_doc_topic_probabilities %>% 
+  group_by(document) %>% 
+  top_n(1, gamma) %>% 
+  ungroup()
+
+season_topics <- season_classification %>% 
+  count(document, topic) %>% 
+  group_by(document) %>% 
+  top_n(1, n) %>% 
+  ungroup() %>% 
+  transmute(consensus = document, topic)
+kable(season_topics)
+  
+
+kable(season_classification %>% 
+  inner_join(season_topics, by = "topic") %>% 
+  filter(document != consensus))
+
+
+topic_assignments <- augment(seasons_lda, data = seasons_dtm) %>% 
+  inner_join(season_topics, by = c(".topic" = "topic"))
+kable(topic_assignments)
+
+topic_assignments %>% 
+  count(document, consensus, wt = count) %>% 
+  group_by(document) %>%   
+  mutate(percent = n / sum(n)) %>% 
+  ggplot(aes(consensus, document, fill = percent)) +
+  geom_tile() +
+  scale_fill_gradient2(high = muted("red"), label = percent_format()) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.grid = element_blank()) +
+  labs(x = "Season words were assigned to",
+       y = "Season words came from",
+       fill = "% of assignments")
+
+```
+
+## What were the most commonly mistaken words?
+
+```{r}
+wrong_words <- topic_assignments %>% 
+  filter(document != consensus)
+
+kable(wrong_words %>% 
+  count(document, consensus, term, wt = count) %>% 
+  ungroup() %>%
+  arrange(desc(n)) %>% 
+  slice(1:10))
+```
+
+## Which seasons tended to be similar to each other in text content?
+
+```{r}
+season_cors <- season_word_counts %>% 
+  pairwise_cor(Season, word, n, sort = T)
+
+set.seed(2018)
+
+season_cors %>% 
+  filter(correlation > 0.7) %>% 
+  graph_from_data_frame() %>% 
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(alpha = correlation, width = 1)) +
+  geom_node_point(size = 6, color = "lightblue") +
+  geom_node_text(aes(label = name), color = "red", size = 6, repel = TRUE) +
+  labs(title = "Similarity between seasons") +
+  theme_void()
+```
+
+Looks like season 1 and 2 discused similar topics while seasons 3 through 9 shared similar topics. 
+
+# Topic modeling: identifying topics by character
+
+## Most important words spoken by each character:
+```{r}
+word_counts <- tidy_scripts %>% 
+  filter(Character %in% top9_mainCharacters$Character[1:9]) %>% 
+  count(Character, word, sort = T) %>% 
+  ungroup()
+
+total_words <- word_counts %>% 
+  group_by(Character) %>% 
+  summarise(total = sum(n))
+kable(total_words)
+  
+word_counts_tf_idf <- left_join(word_counts, total_words) %>% 
+  bind_tf_idf(word, Character, n)
+  
+word_counts_tf_idf %>% 
+  arrange(desc(tf_idf)) %>% 
+  mutate(word = factor(word, levels = rev(unique(word)))) %>%
+  group_by(Character) %>% 
+  top_n(8, tf_idf) %>% 
+  ungroup() %>% 
+  mutate(word = reorder(word, tf_idf)) %>% 
+  ggplot() +
+  geom_col(aes(x = word, y = tf_idf, fill = Character)) +
+  facet_wrap(~ Character, scales = "free") +
+  labs(x = NULL, y = "tf-idf") +
+  coord_flip() +
+  theme_bw()
+
+```
+
+## Similarity between characters:
+
+```{r}
+
+characters_dtm <- word_counts %>% 
+  mutate(Character = as.character(Character)) %>% 
+  cast_dtm(Character, word, n) 
+
+characters_lda <- LDA(characters_dtm, k = 9, control = list(seed = 1234))
+
+character_topics <- tidy(characters_lda, matrix = "beta")
+
+top_terms_by_character <- character_topics %>% 
+  group_by(topic) %>% 
+  top_n(8, beta) %>% 
+  ungroup() %>% 
+  arrange(topic, -beta)
+
+top_terms_by_character %>% 
+  mutate(term = reorder(term, beta)) %>% 
+  ggplot() +
+  geom_col(aes(x = term, y = beta, fill = factor(topic)), show.legend = F) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+
+character_cors <- word_counts %>% 
+  pairwise_cor(Character, word, n, sort = T)
+
+set.seed(2018)
+character_cors %>%
+  filter(correlation > .4) %>%
+  graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(alpha = correlation, width = 1)) +
+  geom_node_point(size = 6, color = "lightblue") +
+  geom_node_text(aes(label = name), color = "red", repel = TRUE) +
+  theme_void()
+```
+
